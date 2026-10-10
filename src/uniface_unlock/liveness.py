@@ -10,7 +10,6 @@ from typing import Tuple
 import numpy as np
 
 from uniface.spoofing import MiniFASNet
-from uniface.types import SpoofingResult
 
 from .config import get_config
 
@@ -79,11 +78,14 @@ class LivenessDetector:
         start_time = time.time()
 
         try:
-            # Use the predict method which handles preprocessing correctly
-            result: SpoofingResult = self.spoofer.predict(image, bbox)
-            latency_ms = (time.time() - start_time) * 1000
-
-            # Get raw probabilities for detailed analysis
+            # Single inference pass. The previous implementation called
+            # self.spoofer.predict() (one inference) and then re-ran
+            # preprocess + session.run (a second inference on the same crop)
+            # purely to read the raw logits for diagnostics. That doubled the
+            # liveness cost on every frame. We now run the ONNX session once
+            # and derive the decision AND the diagnostic probabilities from
+            # the same logits, which are identical to what predict() would
+            # produce (predict() = preprocess -> run -> softmax/argmax).
             input_tensor = self.spoofer.preprocess(image, bbox)
             raw_logits = self.spoofer.session.run(
                 [self.spoofer.output_name],
@@ -116,7 +118,7 @@ class LivenessDetector:
                 'is_real': is_real,
                 'confidence': max_prob,
                 'smoothed_real_probability': smoothed_real_prob,
-                'latency_ms': latency_ms,
+                'latency_ms': (time.time() - start_time) * 1000,
             }
 
             # Decision logic - FAIL CLOSED.

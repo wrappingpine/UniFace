@@ -41,6 +41,7 @@ class FaceEnrollment:
 
     def __init__(self) -> None:
         config = get_config()
+        self.config = config
         self.enrollment_dir = Path.home() / ".config" / "uniface-unlock"
         self.enrollment_dir.mkdir(parents=True, exist_ok=True)
 
@@ -157,8 +158,15 @@ class FaceEnrollment:
 
         Args:
             embedding: Face embedding vector
+
+        Raises:
+            EnrollmentError: If the embedding is malformed (never written)
         """
+        # Validate before touching disk so a bad template is never persisted.
+        self._validate_embedding(embedding)
+
         # Save as numpy file
+        embedding = np.asarray(embedding, dtype=np.float32)
         np.save(self.embedding_path.with_suffix('.npy'), embedding)
 
         # Set secure permissions
@@ -223,13 +231,19 @@ class FaceEnrollment:
             return None
 
     def load_enrollment(self) -> np.ndarray:
-        """Load enrolled face embedding.
+        """Load and validate the enrolled face embedding.
+
+        Validation is fail-closed and read-only: the stored file is never
+        rewritten or normalised here. A template that is not a finite,
+        non-degenerate float32 vector of the expected dimension is rejected
+        rather than passed into cosine similarity, where NaN/inf or a wrong
+        shape could silently produce a match or an exception mid-authentication.
 
         Returns:
-            Face embedding vector
+            Face embedding vector (float32, shape (embedding_dim,))
 
         Raises:
-            EnrollmentError: If enrollment not found
+            EnrollmentError: If enrollment is missing or malformed
         """
         enrollment_file = self.embedding_path.with_suffix('.npy')
 
@@ -239,11 +253,43 @@ class FaceEnrollment:
             )
 
         try:
+            # allow_pickle stays at its default (False): a crafted .npy that
+            # encodes a Python object must not be deserialised.
             embedding = np.load(enrollment_file)
-            logger.info(f"Enrollment loaded: {enrollment_file}")
-            return embedding
         except Exception as e:
             raise EnrollmentError(f"Failed to load enrollment: {e}")
+
+        self._validate_embedding(embedding)
+        logger.info(f"Enrollment loaded: {enrollment_file}")
+        return embedding
+
+    def _validate_embedding(self, embedding: np.ndarray) -> None:
+        """Reject malformed enrollment templates (fail closed)."""
+        cfg = getattr(self, "config", None) or get_config()
+        expected_dim = int(cfg.get("recognition.embedding_dim", 512))
+
+        if not isinstance(embedding, np.ndarray):
+            raise EnrollmentError(
+                f"Enrollment must be a numpy array, got {type(embedding).__name__}"
+            )
+        if embedding.ndim != 1:
+            raise EnrollmentError(
+                f"Enrollment must be 1-dimensional, got shape {embedding.shape}"
+            )
+        if embedding.shape[0] != expected_dim:
+            raise EnrollmentError(
+                f"Enrollment has dim {embedding.shape[0]}, expected {expected_dim}"
+            )
+        if not np.issubdtype(embedding.dtype, np.floating):
+            raise EnrollmentError(
+                f"Enrollment dtype must be floating point, got {embedding.dtype}"
+            )
+        if not np.isfinite(embedding).all():
+            raise EnrollmentError("Enrollment contains NaN or infinite values")
+
+        norm = float(np.linalg.norm(embedding.astype(np.float64)))
+        if not np.isfinite(norm) or norm < 1e-6:
+            raise EnrollmentError("Enrollment has a degenerate (near-zero) norm")
 
     def is_enrolled(self) -> bool:
         """Check if a face is enrolled."""

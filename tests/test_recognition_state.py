@@ -213,10 +213,79 @@ class TestTimeoutRunSummary:
             assert banned not in lowered
 
     def test_step_increments_frames_processed(self, auth):
-        """The counters summarized at timeout are maintained by step()."""
+        """The counters summarized at timeout are maintained by step().
+
+        step() performs no camera I/O, so frame skipping (which lives in the
+        authenticate() loop) must not influence this counter.
+        """
         from uniface_unlock.detector import DetectionError
         auth.detector.validate_exactly_one_face.side_effect = DetectionError("no face")
         auth.step(FRAME, EMB)
         auth.step(FRAME, EMB)
         assert auth.state["frames_processed"] == 2
         assert auth.state["success_count"] == 0
+        assert auth.state["frames_skipped"] == 0
+
+    def test_timeout_summary_reflects_real_loop_counters(self, auth, caplog):
+        """Counters reported at timeout come from the real loop, and the
+        camera-read count is exactly processed + skipped frames.
+
+        This guards the coupling between the loop, the counters and the
+        summary: if skipping or processing ever stopped incrementing its
+        counter, the summary would silently under-report and make a timeout
+        look like "the pipeline never ran".
+        """
+        import logging
+        import re
+        from uniface_unlock.authenticator import AuthenticationError
+        from unittest.mock import MagicMock
+
+        auth.timeout_seconds = 0.05
+        auth.enrollment.is_enrolled.return_value = True
+        auth.enrollment.load_enrollment.return_value = EMB
+        # Each processed frame exits step() through the no-face path, which
+        # increments frames_processed and resets progress. The counters and the
+        # read arithmetic are what this test asserts, not the recognition path.
+        auth.detector.validate_exactly_one_face.side_effect = DetectionError("no face")
+
+        cam = MagicMock()
+        cam.__enter__ = MagicMock(return_value=cam)
+        cam.__exit__ = MagicMock(return_value=False)
+        cam.read.return_value = FRAME
+
+        t = [0.0]
+
+        def fake_clock():
+            t[0] += 0.001
+            return t[0]
+
+        with caplog.at_level(logging.INFO, logger="uniface_unlock.authenticator"):
+            with patch("uniface_unlock.authenticator.Camera", return_value=cam), \
+                 patch("uniface_unlock.authenticator.time.time", side_effect=fake_clock):
+                with pytest.raises(AuthenticationError) as ei:
+                    auth.authenticate()
+        assert ei.value.code == 5
+
+        msg = [r.getMessage() for r in caplog.records
+               if "auth run summary at timeout" in r.getMessage()][0]
+        nums = dict(re.findall(r"(\w+)=(\d+)", msg))
+        processed = int(nums["frames_processed"])
+        skipped = int(nums["frames_skipped"])
+        assert processed >= 1, "loop must have processed frames before timing out"
+        assert cam.read.call_count == processed + skipped
+
+    def test_timeout_summary_helper_matches_state(self, auth):
+        """_timeout_summary() reflects the current state dict and is non-sensitive."""
+        auth.state["frames_processed"] = 7
+        auth.state["frames_skipped"] = 3
+        auth.state["quality_skips"] = 1
+        auth.state["success_count"] = 2
+        auth.state["liveness_consistency"] = 2
+        msg = auth._timeout_summary()
+        assert "frames_processed=7" in msg
+        assert "frames_skipped=3" in msg
+        assert "quality_skips=1" in msg
+        assert "success_count=2/3" in msg
+        assert "liveness_consistency=2/2" in msg
+        for banned in ("embedding", "landmark", "similarity"):
+            assert banned not in msg.lower()

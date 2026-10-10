@@ -404,123 +404,225 @@ def status() -> None:
 
 
 @cli.command()
-def benchmark() -> None:
-    """Benchmark performance."""
+@click.option("--frames", "-n", default=6, help="Inference samples per stage (warm samples = frames-1)")
+def benchmark(frames: int) -> None:
+    """Benchmark performance with honest metric separation.
+
+    Distinguishes:
+      - Raw camera capture FPS (no inference)
+      - Detection-only latency (SCRFD), cold vs warm
+      - Recognition latency (MobileFace)
+      - Liveness latency (MiniFASNet, single pass)
+      - End-to-end per-frame pipeline latency
+      - Intentional frames skipped (authentication.frame_skip)
+      - Dropped/failed camera reads
+      - Process RSS before/after model load and at exit
+      - System RAM and swap usage
+
+    Does NOT enroll faces, modify thresholds, or touch PAM.
+    """
     try:
+        import statistics
+        import time as _time
+        import numpy as np
+        import psutil
         from .camera import Camera
         from .detector import FaceDetector
         from .recognizer import FaceRecognizer
         from .liveness import LivenessDetector
-        import psutil
-        import time as _time
 
         config = get_config()
         device = config.get("camera.device", "/dev/video0")
 
         if not check_camera(device):
-            click.echo(f"❌ Camera not available", err=True)
+            click.echo(f"\u274c Camera not available: {device}", err=True)
             sys.exit(2)
 
-        click.echo("📊 Running benchmark...")
-        click.echo()
-
-        # Startup time (module imports already done)
-        _t0 = _time.time()
-
-        # Camera initialization time
-        _t_cam_start = _time.time()
-        with Camera(device=device) as cam:
-            cam_init_time = (_time.time() - _t_cam_start) * 1000
-            frame = cam.read()
-            if frame is None:
-                click.echo("❌ Failed to read test frame", err=True)
-                sys.exit(1)
-
-            # Detector latency
-            detector = FaceDetector()
-            click.echo("Testing detection...")
-            det_latencies = []
-            for _ in range(5):
-                _s = _time.time()
-                _ = detector.detect(frame)
-                det_latencies.append((_time.time() - _s) * 1000)
-            det_latency = sum(det_latencies) / len(det_latencies)
-            det_max = max(det_latencies)
-
-            # Get face for recognition/liveness tests
-            rec_latency = rec_max = -1
-            live_latency = live_max = -1
+        def _rss_mb():
             try:
-                face = detector.validate_exactly_one_face(frame)
+                with open("/proc/self/status") as fh:
+                    for line in fh:
+                        if line.startswith("VmRSS:"):
+                            return float(line.split()[1]) / 1024.0
+            except OSError:
+                pass
+            return float("nan")
 
-                # Recognizer latency
-                recognizer = FaceRecognizer()
-                click.echo("Testing recognition...")
-                rec_latencies = []
-                for _ in range(5):
-                    _s = _time.time()
-                    _ = recognizer.extract_embedding(frame, face.landmarks)
-                    rec_latencies.append((_time.time() - _s) * 1000)
-                rec_latency = sum(rec_latencies) / len(rec_latencies)
-                rec_max = max(rec_latencies)
+        click.echo("\U0001F4CA Running UniFace Unlock benchmark...")
+        rss_base = _rss_mb()
+        click.echo(f"Process RSS baseline: {rss_base:.1f} MiB")
+        click.echo()
 
-                # Liveness latency
-                liveness = LivenessDetector()
-                click.echo("Testing liveness...")
-                live_latencies = []
-                for _ in range(5):
-                    _s = _time.time()
-                    _ = liveness.check_liveness(frame, face.bbox)
-                    live_latencies.append((_time.time() - _s) * 1000)
-                live_latency = sum(live_latencies) / len(live_latencies)
-                live_max = max(live_latencies)
+        # 1. Camera initialization
+        _t_cam_start = _time.perf_counter()
+        with Camera(device=device) as cam:
+            cam_init_ms = (_time.perf_counter() - _t_cam_start) * 1000
 
-            except Exception as e:
-                click.echo(f"⚠️  Could not get face for full benchmark: {e}")
+            warm_frame = cam.read()
+            if warm_frame is None:
+                click.echo("\u274c Failed to read camera frame", err=True)
+                sys.exit(1)
+            # The first frames from most V4L2 devices are under-exposed while
+            # auto-exposure settles, so discard a few before measuring.
+            for _ in range(5):
+                fr = cam.read()
+                if fr is not None:
+                    warm_frame = fr
 
-            # Effective FPS / frame skipping measurement
-            click.echo("Measuring effective FPS...")
-            frames_processed = 0
-            frames_skipped = 0
-            _fps_start = _time.time()
-            _fps_window = 5.0
-            while _time.time() - _fps_start < _fps_window:
-                f = cam.read()
-                if f is not None:
-                    frames_processed += 1
+            # 2. Raw camera capture rate (NO inference -- measures the camera,
+            #    not the pipeline; the old benchmark misleadingly labelled
+            #    this "Effective FPS")
+            click.echo("Measuring raw camera capture rate (no inference)...")
+            cap_count = 0
+            cap_dropped = 0
+            t_cap = _time.perf_counter()
+            while _time.perf_counter() - t_cap < 2.0:
+                if cam.read() is not None:
+                    cap_count += 1
                 else:
-                    frames_skipped += 1
-            _fps_elapsed = _time.time() - _fps_start
-            effective_fps = frames_processed / _fps_elapsed if _fps_elapsed > 0 else 0
+                    cap_dropped += 1
+            cap_elapsed = _time.perf_counter() - t_cap
+            raw_fps = cap_count / cap_elapsed if cap_elapsed > 0 else 0.0
 
-        startup_time = (_time.time() - _t0) * 1000
+            # 3. Model initialization (cold)
+            click.echo("Loading models...")
+            t_load = _time.perf_counter()
+            detector = FaceDetector()
+            recognizer = FaceRecognizer()
+            liveness = LivenessDetector()
+            model_init_ms = (_time.perf_counter() - t_load) * 1000
+            rss_models = _rss_mb()
 
-        # System stats
-        cpu_percent = psutil.cpu_percent(interval=1)
+            def _lat(fn, n):
+                out = []
+                for _ in range(n):
+                    t0 = _time.perf_counter()
+                    fn()
+                    out.append((_time.perf_counter() - t0) * 1000)
+                return out
+
+            # 4. Detection latency (cold sample is index 0)
+            click.echo("Measuring detection latency (SCRFD)...")
+            det_lats = _lat(lambda: detector.detect(warm_frame), frames)
+
+            # Recognition and liveness need a crop, so their latency is only
+            # meaningful on a frame that actually contains a face. Search a
+            # bounded number of frames rather than gambling on one arbitrary
+            # frame, which used to leave these stages silently unmeasured.
+            # Frames are held in memory only and never written to disk.
+            click.echo("Searching for a frame containing a face...")
+            face_frame = None
+            face = None
+            search_reads = 0
+            while search_reads < 60:
+                search_reads += 1
+                fr = cam.read()
+                if fr is None:
+                    continue
+                fs = detector.detect(fr)
+                if fs:
+                    face_frame, face = fr, fs[0]
+                    break
+
+            rec_lats: list = []
+            live_lats: list = []
+            e2e_lats: list = []
+            if face_frame is not None:
+                click.echo("Measuring recognition latency (MobileFace)...")
+                rec_lats = _lat(
+                    lambda: recognizer.extract_embedding(face_frame, face.landmarks), frames
+                )
+                click.echo("Measuring liveness latency (MiniFASNet)...")
+                live_lats = _lat(
+                    lambda: liveness.check_liveness(face_frame, face.bbox), frames
+                )
+                click.echo("Measuring end-to-end pipeline latency (detect+liveness+recognize)...")
+
+                def _e2e():
+                    # Uses the face-bearing frame so all three stages actually
+                    # run; on a faceless frame detect() short-circuits and the
+                    # measurement silently degrades to detection only.
+                    fs = detector.detect(face_frame)
+                    if fs:
+                        liveness.check_liveness(face_frame, fs[0].bbox)
+                        recognizer.extract_embedding(face_frame, fs[0].landmarks)
+
+                e2e_lats = _lat(_e2e, max(3, frames // 2))
+            else:
+                click.echo("\u26a0\ufe0f  No face found in "
+                           f"{search_reads} frames; downstream stages not measured")
+
+            # 5. Pipeline duty cycle: processed vs intentionally skipped vs dropped
+            click.echo("Measuring pipeline duty cycle over 3 seconds...")
+            frame_skip = int(config.get("authentication.frame_skip", 2))
+            processed = 0
+            intentional_skips = 0
+            camera_drops = 0
+            t_pipe = _time.perf_counter()
+            while _time.perf_counter() - t_pipe < 3.0:
+                fr = cam.read()
+                if fr is None:
+                    camera_drops += 1
+                    continue
+                detector.detect(fr)
+                processed += 1
+                for _ in range(frame_skip):
+                    if _time.perf_counter() - t_pipe >= 3.0:
+                        break
+                    if cam.read() is None:
+                        camera_drops += 1
+                    else:
+                        intentional_skips += 1
+            pipe_elapsed = _time.perf_counter() - t_pipe
+            eff_fps = processed / pipe_elapsed if pipe_elapsed > 0 else 0.0
+
         mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        rss_end = _rss_mb()
+        cpu_percent = psutil.cpu_percent(interval=0.5)
+
+        def _stat(name, lats):
+            if not lats:
+                return
+            warm = lats[1:] or lats
+            click.echo(
+                f"{name:<26} cold={lats[0]:>7.1f}  "
+                f"warm mean={statistics.fmean(warm):>7.1f}  "
+                f"med={statistics.median(warm):>7.1f}  "
+                f"max={max(warm):>7.1f}  n={len(lats)}"
+            )
 
         click.echo()
-        click.echo("=== Benchmark Results ===")
-        click.echo(f"Startup time:        {startup_time:.1f} ms")
-        click.echo(f"Camera init time:    {cam_init_time:.1f} ms")
-        click.echo(f"Detection avg:       {det_latency:.1f} ms")
-        click.echo(f"Detection max:       {det_max:.1f} ms")
-        click.echo(f"Recognition avg:     {rec_latency:.1f} ms")
-        click.echo(f"Recognition max:     {rec_max:.1f} ms")
-        click.echo(f"Liveness avg:        {live_latency:.1f} ms")
-        click.echo(f"Liveness max:        {live_max:.1f} ms")
-        click.echo(f"Effective FPS:       {effective_fps:.1f}")
-        click.echo(f"Frames processed:    {frames_processed}")
-        click.echo(f"Frames skipped:      {frames_skipped}")
+        click.echo("=== Latency profile (ms) ===")
+        click.echo(f"Camera init:                 {cam_init_ms:>7.1f}")
+        click.echo(f"Model load (3 models):       {model_init_ms:>7.1f}")
+        _stat("Detection (SCRFD)", det_lats)
+        _stat("Recognition (MobileFace)", rec_lats)
+        _stat("Liveness (MiniFASNet)", live_lats)
+        _stat("End-to-end per frame", e2e_lats)
+
         click.echo()
-        click.echo(f"CPU usage: {cpu_percent:.1f}%")
-        click.echo(f"RAM usage: {mem.percent:.1f}% ({mem.used / 1024**2:.0f}MB / {mem.total / 1024**2:.0f}MB)")
+        click.echo("=== Frame rates ===")
+        click.echo(f"Raw camera capture:  {raw_fps:>6.1f} FPS  "
+                   f"({cap_count} reads, {cap_dropped} dropped)")
+        click.echo(f"Inference-processed: {eff_fps:>6.1f} FPS  ({processed} frames)")
+        click.echo(f"Intentional skips:   {intentional_skips} (frame_skip={frame_skip})")
+        click.echo(f"Camera drops:        {camera_drops}")
+
         click.echo()
-        click.echo("✅ Benchmark complete")
+        click.echo("=== Memory ===")
+        click.echo(f"Process RSS baseline:   {rss_base:>7.1f} MiB")
+        click.echo(f"Process RSS after load: {rss_models:>7.1f} MiB (+{rss_models - rss_base:.1f})")
+        click.echo(f"Process RSS at exit:    {rss_end:>7.1f} MiB")
+        click.echo(f"System RAM: {mem.percent:.1f}% used, {mem.available / 1024**2:.0f} MiB available")
+        click.echo(f"System swap: {swap.percent:.1f}% used ({swap.used / 1024**2:.0f} / {swap.total / 1024**2:.0f} MiB)")
+        click.echo(f"CPU (system-wide, 0.5s sample): {cpu_percent:.0f}%")
+        click.echo()
+        click.echo("\u2705 Benchmark complete")
 
     except Exception as e:
         logger.error(f"Benchmark error: {e}")
-        click.echo(f"❌ Error: {e}", err=True)
+        click.echo(f"\u274c Error: {e}", err=True)
         sys.exit(1)
 
 

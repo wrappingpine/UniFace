@@ -94,23 +94,18 @@ class FaceAuthenticator:
         try:
             with Camera(device=camera_device, resolution=resolution, fps=10) as cam:
                 while True:
-                    # Check timeout
+                    # Check timeout BEFORE reading, so a zero/near-zero timeout
+                    # fires without consuming a camera frame and the camera
+                    # context is still closed on the way out.
                     if time.time() - start_time > self.timeout_seconds:
-                        s = self.state
-                        logger.info(
-                            "auth run summary at timeout: "
-                            f"frames_processed={s['frames_processed']}, "
-                            f"quality_skips={s['quality_skips']}, "
-                            f"success_count={s['success_count']}/{self.required_frames}, "
-                            f"liveness_consistency={s['liveness_consistency']}/"
-                            f"{self.liveness.consistency_required}"
-                        )
+                        logger.info(self._timeout_summary())
                         raise AuthenticationError("Authentication timeout", code=5)
 
                     frame = cam.read()
                     if frame is None:
                         # A read failure is not a valid evidence frame.
                         # Fail closed: reset the consecutive-success counter.
+                        self.state["frames_skipped"] += 1
                         self._reset_progress()
                         continue
 
@@ -120,8 +115,51 @@ class FaceAuthenticator:
                         logger.info("AUTH SUCCESS")
                         return True
 
+                    # Frame skipping: drop the next `frame_skip` raw frames
+                    # without inference. The skipped frames are counted so the
+                    # timeout summary can distinguish "not enough evidence" from
+                    # "the pipeline never ran". Skipping is bounded by the
+                    # configured value and never extends the timeout window.
+                    self._skip_frames(cam, start_time)
+
         except CameraError as e:
             raise AuthenticationError(f"Camera failure: {e}", code=2)
+
+    def _timeout_summary(self) -> str:
+        """Build the non-sensitive run summary logged on timeout."""
+        s = self.state
+        return (
+            "auth run summary at timeout: "
+            f"frames_processed={s['frames_processed']}, "
+            f"frames_skipped={s['frames_skipped']}, "
+            f"quality_skips={s['quality_skips']}, "
+            f"success_count={s['success_count']}/{self.required_frames}, "
+            f"liveness_consistency={s['liveness_consistency']}/"
+            f"{self.liveness.consistency_required}"
+        )
+
+    def _skip_frames(self, cam, start_time: float) -> None:
+        """Read and discard up to `frame_skip` raw frames without inference.
+
+        Bounded: stops after `frame_skip` frames, or immediately if the
+        authentication timeout would be exceeded. A failed camera read is
+        counted as a skipped frame and resets progress (fail closed).
+        """
+        if self.frame_skip <= 0:
+            return
+        skipped = 0
+        while skipped < self.frame_skip:
+            if time.time() - start_time > self.timeout_seconds:
+                logger.info(self._timeout_summary())
+                raise AuthenticationError("Authentication timeout", code=5)
+            f2 = cam.read()
+            if f2 is None:
+                self.state["frames_skipped"] += 1
+                self._reset_progress()
+                skipped += 1
+                continue
+            self.state["frames_skipped"] += 1
+            skipped += 1
 
     def _initial_state(self) -> dict:
         """Return a fresh authentication state."""

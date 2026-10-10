@@ -33,6 +33,7 @@ class FaceDetector:
     - Configurable detection threshold
     - Measure inference time
     """
+
     _instance = None
     _initialized = False
 
@@ -50,19 +51,53 @@ class FaceDetector:
         self.enable_landmarks = config.get("detection.enable_landmarks", True)
         self.min_face_size = config.get("detection.min_face_size", 10000)  # min pixels
 
+        # Detection input size (square). The default (640, 640) is what the
+        # enrolled template was produced with. A smaller size is measurably
+        # faster but changes the bbox/landmark geometry slightly; it is only
+        # used when the user has explicitly opted in via config and the
+        # recognition decision against the enrolled template has been verified
+        # to be unaffected (see scripts/probe_recognition_vs_enrolled.py).
+        self.input_size = self._parse_input_size(
+            config.get("detection.input_size", 640)
+        )
+
         # Initialize detector based on config
         if model_name.upper() == "SCRFD":
-            self.detector = SCRFD()
+            self.detector = SCRFD(input_size=self.input_size)
         elif model_name.upper() == "RETINAFACE":
             self.detector = RetinaFace()
         elif model_name.upper() == "BLAZEFACE":
             self.detector = BlazeFace()
         else:
             logger.warning(f"Unknown detector {model_name}, using SCRFD")
-            self.detector = SCRFD()
+            self.detector = SCRFD(input_size=self.input_size)
 
-        logger.info(f"Face detector initialized: {model_name}")
+        logger.info(
+            f"Face detector initialized: {model_name} input_size={self.input_size}"
+        )
         self._initialized = True
+
+    @staticmethod
+    def _parse_input_size(value) -> Tuple[int, int]:
+        """Normalise a detection input_size config value to (w, h).
+
+        Accepts an int (square) or a 2-element list/tuple. Defaults to 640.
+        Raises ValueError on malformed input so bad config is caught at
+        startup rather than silently producing wrong geometry.
+        """
+        if value is None:
+            return (640, 640)
+        if isinstance(value, (int, float)):
+            n = int(value)
+            if n <= 0:
+                raise ValueError(f"detection.input_size must be positive, got {value}")
+            return (n, n)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            w, h = int(value[0]), int(value[1])
+            if w <= 0 or h <= 0:
+                raise ValueError(f"detection.input_size must be positive, got {value}")
+            return (w, h)
+        raise ValueError(f"detection.input_size must be int or [w, h], got {value!r}")
 
     def detect(
         self,
@@ -178,6 +213,7 @@ class FaceDetector:
         return {
             "model": self.detector.__class__.__name__,
             "threshold": self.threshold,
+            "input_size": self.input_size,
             "enable_landmarks": self.enable_landmarks,
             "supports_landmarks": getattr(self.detector, 'supports_landmarks', False),
             "supports_alignment": getattr(self.detector, 'supports_alignment', False),

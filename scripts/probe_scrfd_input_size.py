@@ -79,6 +79,9 @@ def capture_frames(n: int, device: str):
 
 
 def run_size(size: int, frames, reference: list | None):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from uniface.detection import SCRFD
     from uniface.recognition import MobileFace
 

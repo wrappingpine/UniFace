@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -22,6 +23,12 @@ DEFAULT_CONFIG = {
         "max_faces": 1,
         "enable_landmarks": True,
         "min_face_size": 10000,
+        # SCRFD inference input (square). 640 matches the pipeline the
+        # enrollment template was produced with and is the safe default.
+        # 480/320 are measurably faster but shift landmark geometry; only
+        # change after running scripts/probe_recognition_vs_enrolled.py and
+        # scripts/probe_scrfd_input_size.py against the enrolled face.
+        "input_size": 640,
     },
     "recognition": {
         "model": "MobileFace",
@@ -70,7 +77,10 @@ class Config:
             config_path = config_dir / "config.json"
 
         self.config_path = Path(config_path).expanduser()
-        self._config = DEFAULT_CONFIG.copy()
+        # deepcopy: _deep_update mutates nested dicts in place, so a shallow
+        # copy would let a loaded config file write straight into the
+        # module-level DEFAULT_CONFIG and leak into every later Config().
+        self._config = copy.deepcopy(DEFAULT_CONFIG)
         self.load()
 
     def load(self) -> None:

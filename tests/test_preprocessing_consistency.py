@@ -12,7 +12,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from uniface.types import Face
-from uniface_unlock.enrollment import FaceEnrollment
+from uniface_unlock.enrollment import FaceEnrollment, EnrollmentError
 from uniface_unlock.recognizer import FaceRecognizer
 from uniface_unlock.detector import FaceDetector
 from uniface_unlock.config import get_config
@@ -227,19 +227,37 @@ class TestTemplateIntegrity:
         assert meta["recognition_model_sha256"] == live_sha
 
     def test_embedding_shape_mismatch_detection(self, mock_pipeline):
-        """Enrollment with wrong embedding dimension should be flagged."""
+        """A wrong-dimension template is flagged, never silently trusted.
+
+        Two layers are checked:
+          - the meta sidecar records the real shape, so a mismatch is visible
+            to `diagnose` (original intent of this test)
+          - save_enrollment refuses to persist a wrong-dimension vector, and
+            load_enrollment refuses to return one that got onto disk by other
+            means (e.g. written by an older release). Both fail closed.
+        """
         enrollment, _ = mock_pipeline
-        
-        # Simulate old template with different dimension
+
         bad_emb = np.random.randn(256).astype(np.float32)
         bad_emb = bad_emb / np.linalg.norm(bad_emb)
-        
-        enrollment.save_enrollment(bad_emb)
+
+        # Layer 1: save_enrollment refuses to write a malformed template
+        with pytest.raises(EnrollmentError):
+            enrollment.save_enrollment(bad_emb)
+
+        # Layer 2: simulate a legacy file already on disk (bypassing
+        # save_enrollment, as an older release would have written it), then
+        # confirm the metadata still records the wrong shape and that loading
+        # it fails closed instead of returning a template for matching.
+        np.save(enrollment.embedding_path.with_suffix('.npy'), bad_emb)
         enrollment.save_enrollment_meta()
-        
+
         meta = enrollment.load_meta()
         assert meta["embedding_shape"] == [256]
         assert meta["embedding_shape"] != [512]  # would trigger warning in diagnose
+
+        with pytest.raises(EnrollmentError):
+            enrollment.load_enrollment()
 
 
 class TestLivenessIsIndependent:
