@@ -1,0 +1,35 @@
+[project]
+name = "uniface-unlock"
+version = "0.1.0"
+description = "Local face authentication system using UniFace for Pop!_OS"
+authors = [{name = "shubham"}]
+requires-python = ">=3.10"
+dependencies = [
+    "uniface[cpu]>=4.0.0",
+    "opencv-python>=4.5.0",
+    "numpy>=1.21.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.64.0",
+    "psutil>=5.9.0",
+]
+
+[project.scripts]
+uniface-unlock = "uniface_unlock.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+# Automated suite lives only in tests/. Hardware/interactive scripts under
+# scripts/ (and the manual self-test) are runnable by hand but must never be
+# collected by pytest: they need a live camera and their helper functions
+# are named check_*, not test_*, as a second line of defense.
+testpaths = ["tests"]
+norecursedirs = ["scripts", "venv", ".git", "__pycache__"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+python_classes = ["Test*"]
+filterwarnings = [
+    "error::pytest.PytestReturnNotNoneWarning",
+]
